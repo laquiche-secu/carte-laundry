@@ -90,6 +90,176 @@ class CarteLaundry extends HTMLElement {
     return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
   }
 
+  _startOfWeek(d) {
+    // Semaine calée sur le lundi (convention française)
+    const date = new Date(d);
+    const day = date.getDay(); // 0 = dimanche
+    const diff = (day === 0 ? -6 : 1) - day;
+    date.setDate(date.getDate() + diff);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }
+
+  _startOfMonth(d) {
+    const date = new Date(d);
+    date.setDate(1);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }
+
+  // ------------------------------------------------------------------
+  // Valeur du capteur d'énergie au début d'une période (semaine/mois),
+  // lue dans les statistiques long terme de Home Assistant — celles-ci
+  // sont conservées indéfiniment, contrairement à l'historique brut.
+  // ------------------------------------------------------------------
+  async _energyAtPeriodStart(startDate) {
+    const energyId = this.config.entity_energy;
+    if (!energyId) return null;
+    try {
+      const startIso = startDate.toISOString();
+      const endIso = new Date(startDate.getTime() + 3 * 3600 * 1000).toISOString();
+      const stats = await this._hass.callWS({
+        type: "recorder/statistics_during_period",
+        start_time: startIso,
+        end_time: endIso,
+        statistic_ids: [energyId],
+        period: "hour",
+        types: ["sum"],
+      });
+      const rows = (stats && stats[energyId]) || [];
+      const first = rows.find((r) => typeof r.sum === "number");
+      return first ? first.sum : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Historique brut de l'état "en fonctionnement" depuis une date donnée,
+  // utilisé pour compter les cycles terminés (transitions on -> off).
+  // Nécessite que le recorder conserve l'historique sur toute la période
+  // souhaitée (voir purge_keep_days dans configuration.yaml).
+  // ------------------------------------------------------------------
+  async _runningHistorySince(startDate) {
+    const runId = this.config.entity_running;
+    try {
+      const result = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: startDate.toISOString(),
+        end_time: new Date().toISOString(),
+        entity_ids: [runId],
+        minimal_response: false,
+        no_attributes: true,
+      });
+      return (result && result[runId]) || [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  _countCompletedCycles(rows, weekStart, monthStartUnusedYet) {
+    const MIN_MS = 5 * 60 * 1000; // ignore les faux départs < 5 min
+    let weekCount = 0;
+    let monthCount = 0;
+    let onSince = null;
+    for (const row of rows) {
+      const state = row.state ?? row.s;
+      const ts = row.last_changed ?? row.lu;
+      if (!ts) continue;
+      if (state === "on" && onSince === null) {
+        onSince = new Date(ts).getTime();
+      } else if (state === "off" && onSince !== null) {
+        const offTs = new Date(ts).getTime();
+        if (offTs - onSince >= MIN_MS) {
+          monthCount++;
+          if (offTs >= weekStart.getTime()) weekCount++;
+        }
+        onSince = null;
+      }
+    }
+    return { weekCount, monthCount };
+  }
+
+  // ------------------------------------------------------------------
+  // Recalcule les stats semaine/mois depuis l'historique et les
+  // statistiques — appelé périodiquement, jamais via des capteurs dédiés.
+  // ------------------------------------------------------------------
+  async _refreshPeriodStats() {
+    if (this._statsLoading) return;
+    this._statsLoading = true;
+    try {
+      const c = this.config;
+      const now = new Date();
+      const weekStart = this._startOfWeek(now);
+      const monthStart = this._startOfMonth(now);
+
+      const [weekBase, monthBase, runningRows] = await Promise.all([
+        this._energyAtPeriodStart(weekStart),
+        this._energyAtPeriodStart(monthStart),
+        this._runningHistorySince(monthStart),
+      ]);
+
+      const currentEnergy = c.entity_energy ? this._num(c.entity_energy, null) : null;
+      const price = c.entity_price ? this._num(c.entity_price, 0) : 0;
+
+      this._weekCost = weekBase !== null && currentEnergy !== null
+        ? Math.max(0, currentEnergy - weekBase) * price
+        : null;
+      this._monthCost = monthBase !== null && currentEnergy !== null
+        ? Math.max(0, currentEnergy - monthBase) * price
+        : null;
+
+      const { weekCount, monthCount } = this._countCompletedCycles(runningRows, weekStart, monthStart);
+      this._weekCount = weekCount;
+      this._monthCount = monthCount;
+
+      this._renderStats();
+    } finally {
+      this._statsLoading = false;
+      this._lastStatsFetch = Date.now();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Énergie au tout début du cycle en cours, pour afficher son coût en
+  // direct — récupérée depuis l'historique récent (toujours disponible,
+  // même avec une rétention recorder courte).
+  // ------------------------------------------------------------------
+  async _ensureCycleBaseline() {
+    const energyId = this.config.entity_energy;
+    if (!energyId || !this._runningSince) return;
+    if (this._cycleBaselineFor === this._runningSince) return;
+    try {
+      const result = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: this._runningSince,
+        end_time: new Date().toISOString(),
+        entity_ids: [energyId],
+        minimal_response: false,
+        no_attributes: true,
+      });
+      const rows = (result && result[energyId]) || [];
+      const first = rows.find((r) => {
+        const s = r.state ?? r.s;
+        return s !== undefined && s !== "unknown" && s !== "unavailable";
+      });
+      const state = first ? (first.state ?? first.s) : null;
+      this._cycleBaselineEnergy = state !== null ? parseFloat(state) : this._num(energyId, null);
+    } catch (e) {
+      this._cycleBaselineEnergy = this._num(energyId, null);
+    }
+    this._cycleBaselineFor = this._runningSince;
+  }
+
+  _renderStats() {
+    if (!this.shadowRoot) return;
+    const sr = this.shadowRoot;
+    sr.getElementById("cll-weekcount").textContent = this._weekCount ?? "…";
+    sr.getElementById("cll-weekcost").textContent = this._weekCost != null ? this._fmtEuro(this._weekCost) : "—";
+    sr.getElementById("cll-monthcount").textContent = this._monthCount ?? "…";
+    sr.getElementById("cll-monthcost").textContent = this._monthCost != null ? this._fmtEuro(this._monthCost) : "—";
+  }
+
   _build() {
     const root = document.createElement("div");
     root.innerHTML = `
@@ -230,6 +400,7 @@ class CarteLaundry extends HTMLElement {
 
     const runningState = this._entity(c.entity_running);
     const running = runningState && runningState.state === "on";
+    const wasRunning = this._running;
     this._running = running;
     this._runningSince = runningState ? runningState.last_changed : null;
 
@@ -277,15 +448,36 @@ class CarteLaundry extends HTMLElement {
       }
       this._updateDuration();
 
-      if (c.entity_cycle_cost) {
-        sr.getElementById("cll-cyclecost").textContent = this._fmtEuro(this._num(c.entity_cycle_cost, 0));
+      // Un nouveau cycle vient de démarrer : on va chercher l'énergie de
+      // référence dans l'historique récent (pas de capteur dédié).
+      if (!wasRunning) this._ensureCycleBaseline();
+
+      if (c.entity_energy && c.entity_price) {
+        if (this._cycleBaselineEnergy != null) {
+          const currentEnergy = this._num(c.entity_energy, 0);
+          const price = this._num(c.entity_price, 0);
+          const cost = Math.max(0, currentEnergy - this._cycleBaselineEnergy) * price;
+          sr.getElementById("cll-cyclecost").textContent = this._fmtEuro(cost);
+        } else {
+          sr.getElementById("cll-cyclecost").textContent = "…";
+        }
       }
     }
 
-    if (c.entity_week_count) sr.getElementById("cll-weekcount").textContent = Math.round(this._num(c.entity_week_count, 0));
-    if (c.entity_week_cost) sr.getElementById("cll-weekcost").textContent = this._fmtEuro(this._num(c.entity_week_cost, 0));
-    if (c.entity_month_count) sr.getElementById("cll-monthcount").textContent = Math.round(this._num(c.entity_month_count, 0));
-    if (c.entity_month_cost) sr.getElementById("cll-monthcost").textContent = this._fmtEuro(this._num(c.entity_month_cost, 0));
+    // Un cycle vient de se terminer : les stats semaine/mois seront
+    // légèrement obsolètes le temps que le recorder écrive l'historique,
+    // on les rafraîchit peu après.
+    if (wasRunning && !running) {
+      setTimeout(() => this._refreshPeriodStats(), 15000);
+    }
+
+    // Rafraîchissement périodique des stats semaine/mois (calculées à la
+    // volée depuis l'historique — aucun capteur dédié à créer).
+    if (!this._lastStatsFetch || Date.now() - this._lastStatsFetch > 5 * 60 * 1000) {
+      this._lastStatsFetch = Date.now();
+      this._refreshPeriodStats();
+    }
+    this._renderStats();
   }
 
   disconnectedCallback() {
@@ -302,11 +494,7 @@ class CarteLaundry extends HTMLElement {
       entity_current: "sensor.lave_linge_current",
       entity_energy: "sensor.lave_linge_energy",
       entity_running: "binary_sensor.lave_linge_cycle_en_cours",
-      entity_cycle_cost: "sensor.lave_linge_cout_du_cycle_en_cours",
-      entity_week_count: "sensor.lavages_semaine",
-      entity_week_cost: "sensor.lave_linge_cout_cette_semaine",
-      entity_month_count: "sensor.lavages_mois",
-      entity_month_cost: "sensor.lave_linge_cout_ce_mois",
+      entity_price: "input_number.prix_kwh",
     };
   }
 
@@ -331,11 +519,7 @@ const CLL_LABELS = {
   entity_current: "Capteur de courant (A)",
   entity_energy: "Capteur d'énergie cumulée (kWh)",
   entity_running: "Capteur « cycle en cours »",
-  entity_cycle_cost: "Coût du cycle en cours",
-  entity_week_count: "Nombre de cycles — semaine",
-  entity_week_cost: "Coût — semaine",
-  entity_month_count: "Nombre de cycles — mois",
-  entity_month_cost: "Coût — mois",
+  entity_price: "Prix du kWh (calcul uniquement, non affiché)",
 };
 
 class CarteLaundryEditor extends HTMLElement {
@@ -382,23 +566,7 @@ class CarteLaundryEditor extends HTMLElement {
       { name: "entity_current", selector: { entity: { domain: "sensor" } } },
       { name: "entity_energy", selector: { entity: { domain: "sensor" } } },
       { name: "entity_running", selector: { entity: { domain: "binary_sensor" } } },
-      { name: "entity_cycle_cost", selector: { entity: { domain: "sensor" } } },
-      {
-        name: "",
-        type: "grid",
-        schema: [
-          { name: "entity_week_count", selector: { entity: { domain: "sensor" } } },
-          { name: "entity_week_cost", selector: { entity: { domain: "sensor" } } },
-        ],
-      },
-      {
-        name: "",
-        type: "grid",
-        schema: [
-          { name: "entity_month_count", selector: { entity: { domain: "sensor" } } },
-          { name: "entity_month_cost", selector: { entity: { domain: "sensor" } } },
-        ],
-      },
+      { name: "entity_price", selector: { entity: { domain: "input_number" } } },
     ];
   }
 

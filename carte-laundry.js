@@ -69,6 +69,7 @@ class CarteLaundry extends HTMLElement {
       this._build();
       this._built = true;
       this._bootstrapRunningState();
+      this._loadLastCycle();
     }
     this._update();
   }
@@ -203,6 +204,57 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
+  // Recherche du dernier cycle terminé sur une fenêtre large (7 jours),
+  // indépendamment de _bootstrapRunningState qui ne regarde que les
+  // dernières heures. Nécessaire car le dernier lavage peut remonter
+  // à plus longtemps que ça.
+  // ------------------------------------------------------------------
+  async _loadLastCycle() {
+    const c = this.config;
+    const start = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    const rows = await this._historyRows(c.entity_power, start, new Date());
+    const threshold = c.power_threshold ?? 8;
+    const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
+
+    let running = false;
+    let onSince = null;
+    let belowSince = null;
+    let last = null;
+
+    for (const row of rows) {
+      const val = parseFloat(row.state ?? row.s);
+      const ts = row.last_changed ?? row.lu;
+      if (isNaN(val) || !ts) continue;
+      const tsMs = new Date(ts).getTime();
+      if (val > threshold) {
+        belowSince = null;
+        if (!running) {
+          running = true;
+          onSince = tsMs;
+        }
+      } else if (running) {
+        if (belowSince === null) belowSince = tsMs;
+        if (tsMs - belowSince >= stopDelayMs) {
+          const cycleEnd = belowSince;
+          if (cycleEnd - onSince >= minCycleMs) {
+            last = { start: onSince, end: cycleEnd };
+          }
+          running = false;
+          onSince = null;
+          belowSince = null;
+        }
+      }
+    }
+
+    if (last && (!this._lastCycle || last.end > this._lastCycle.end)) {
+      this._lastCycle = { ...last, cost: null };
+      this._computeCycleCost(last.start, last.end);
+      this._update();
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Machine à état "en direct" : à chaque mise à jour, on avance le
   // même algorithme seuil + délai que le bootstrap, à partir de la
   // dernière valeur connue de sensor.xxx_power.
@@ -257,61 +309,29 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
-  // Valeur du capteur d'énergie au début d'une période (semaine/mois),
-  // lue dans les statistiques long terme de Home Assistant (conservées
-  // indéfiniment par défaut, contrairement à l'historique brut). Ce
-  // sont les statistiques natives de votre capteur d'énergie — aucune
-  // entité supplémentaire n'est créée.
+  // Énergie consommée sur une période, en sommant les variations
+  // horaires ("change") des statistiques long terme de Home Assistant.
+  // Beaucoup plus robuste qu'une différence entre deux points ponctuels :
+  // ça gère nativement les resets de compteur et les données éparses
+  // (par ex. si l'entité n'existait pas depuis le début du mois).
   // ------------------------------------------------------------------
-  async _energyAtPeriodStart(startDate) {
+  async _energyConsumedInPeriod(startDate, endDate) {
     const energyId = this.config.entity_energy;
     if (!energyId) return null;
     try {
-      const startIso = startDate.toISOString();
-      const endIso = new Date(startDate.getTime() + 3 * 3600 * 1000).toISOString();
       const stats = await this._hass.callWS({
         type: "recorder/statistics_during_period",
-        start_time: startIso,
-        end_time: endIso,
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
         statistic_ids: [energyId],
         period: "hour",
-        types: ["sum"],
+        types: ["change"],
       });
       const rows = (stats && stats[energyId]) || [];
-      const first = rows.find((r) => typeof r.sum === "number");
-      return first ? first.sum : null;
+      if (!rows.length) return null;
+      return rows.reduce((sum, r) => sum + (typeof r.change === "number" ? r.change : 0), 0);
     } catch (e) {
-      console.warn("carte-laundry: échec de lecture des statistiques (début de période)", e);
-      return null;
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // Valeur la plus récente du capteur d'énergie, lue via les mêmes
-  // statistiques long terme (et non l'état brut de l'entité). Important :
-  // les statistiques d'un capteur "energy" sont normalisées en kWh par
-  // Home Assistant, alors que l'état brut peut être dans une autre unité
-  // (Wh par ex.). Comparer les deux directement provoquait un coût
-  // totalement faussé — on compare donc toujours statistique à statistique.
-  // ------------------------------------------------------------------
-  async _latestEnergyStat() {
-    const energyId = this.config.entity_energy;
-    if (!energyId) return null;
-    try {
-      const end = new Date();
-      const start = new Date(end.getTime() - 6 * 3600 * 1000);
-      const stats = await this._hass.callWS({
-        type: "recorder/statistics_during_period",
-        start_time: start.toISOString(),
-        end_time: end.toISOString(),
-        statistic_ids: [energyId],
-        period: "hour",
-        types: ["sum"],
-      });
-      const rows = ((stats && stats[energyId]) || []).filter((r) => typeof r.sum === "number");
-      return rows.length ? rows[rows.length - 1].sum : null;
-    } catch (e) {
-      console.warn("carte-laundry: échec de lecture des statistiques (valeur actuelle)", e);
+      console.warn("carte-laundry: échec de lecture des statistiques (consommation période)", e);
       return null;
     }
   }
@@ -375,21 +395,16 @@ class CarteLaundry extends HTMLElement {
       const weekStart = this._startOfWeek(now);
       const monthStart = this._startOfMonth(now);
 
-      const [weekBase, monthBase, nowSum, powerRows] = await Promise.all([
-        this._energyAtPeriodStart(weekStart),
-        this._energyAtPeriodStart(monthStart),
-        this._latestEnergyStat(),
+      const [weekEnergy, monthEnergy, powerRows] = await Promise.all([
+        this._energyConsumedInPeriod(weekStart, now),
+        this._energyConsumedInPeriod(monthStart, now),
         this._historyRows(c.entity_power, monthStart, now),
       ]);
 
       const price = c.price_kwh ?? 0;
 
-      this._weekCost = weekBase !== null && nowSum !== null
-        ? Math.max(0, nowSum - weekBase) * price
-        : null;
-      this._monthCost = monthBase !== null && nowSum !== null
-        ? Math.max(0, nowSum - monthBase) * price
-        : null;
+      this._weekCost = weekEnergy !== null ? Math.max(0, weekEnergy) * price : null;
+      this._monthCost = monthEnergy !== null ? Math.max(0, monthEnergy) * price : null;
 
       const { weekCount, monthCount } = this._countCyclesFromPowerHistory(powerRows, weekStart);
       this._weekCount = weekCount;

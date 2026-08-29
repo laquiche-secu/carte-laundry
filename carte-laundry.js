@@ -1,7 +1,11 @@
 // ==========================================================================
 // carte-laundry.js — Carte Lovelace personnalisée pour Home Assistant
 // Fonctionne pour un lave-linge OU un sèche-linge, selon l'option
-// "appliance_type" dans la configuration (design et libellés adaptés).
+// "appliance_type". Aucune entité à créer côté Home Assistant : la carte
+// utilise directement vos capteurs natifs (puissance, courant, énergie)
+// et détecte elle-même les cycles + calcule les coûts, à partir de
+// paramètres saisis dans la configuration de la carte (seuil, délai,
+// prix du kWh...). Tout se configure via l'éditeur graphique.
 // ==========================================================================
 // Installation :
 // 1. Copiez ce fichier dans /config/www/carte-laundry.js
@@ -9,9 +13,7 @@
 //      URL : /local/carte-laundry.js
 //      Type : Module JavaScript
 // 3. Ajoutez la carte à votre tableau de bord (Ajouter une carte >
-//    "Carte Laundry") : un formulaire graphique permet de tout configurer,
-//    y compris le type d'appareil. lovelace-exemple.yaml reste disponible
-//    si vous préférez le YAML.
+//    "Carte Laundry") : un formulaire graphique permet de tout configurer.
 // ==========================================================================
 
 const CLL_TYPES = {
@@ -33,16 +35,24 @@ const CLL_TYPES = {
   },
 };
 
+const CLL_DEFAULTS = {
+  power_scale_max: 2200,   // W — échelle du hublot
+  power_threshold: 8,      // W — au-delà, on considère que ça tourne
+  stop_delay_minutes: 4,   // minutes sous le seuil avant de considérer que c'est arrêté (anti-pause)
+  min_cycle_minutes: 5,    // durée minimale pour compter un vrai cycle (anti faux-départs)
+  price_kwh: 0.2516,       // €/kWh
+};
+
 class CarteLaundry extends HTMLElement {
   setConfig(config) {
-    if (!config.entity_power || !config.entity_running) {
-      throw new Error("Vous devez définir au minimum 'entity_power' et 'entity_running'.");
+    if (!config.entity_power) {
+      throw new Error("Vous devez définir au minimum 'entity_power'.");
     }
     const applianceType = CLL_TYPES[config.appliance_type] ? config.appliance_type : "washer";
     this.config = {
       appliance_type: applianceType,
       subtitle: "",
-      power_scale_max: 2200, // W — utilisé pour l'échelle du hublot
+      ...CLL_DEFAULTS,
       ...config,
       name: config.name || CLL_TYPES[applianceType].label,
     };
@@ -58,6 +68,7 @@ class CarteLaundry extends HTMLElement {
     if (!this._built) {
       this._build();
       this._built = true;
+      this._bootstrapRunningState();
     }
     this._update();
   }
@@ -107,10 +118,106 @@ class CarteLaundry extends HTMLElement {
     return date;
   }
 
+  async _historyRows(entityId, startDate, endDate) {
+    try {
+      const result = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        entity_ids: [entityId],
+        minimal_response: false,
+        no_attributes: true,
+      });
+      return (result && result[entityId]) || [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Reconstruit l'état "en marche" au chargement de la carte, en
+  // rejouant l'historique récent de la puissance (aucune entité dédiée
+  // n'existe : tout est déduit de sensor.xxx_power + seuil/délai).
+  // ------------------------------------------------------------------
+  async _bootstrapRunningState() {
+    const c = this.config;
+    const start = new Date(Date.now() - 6 * 3600 * 1000); // 6h suffisent pour couvrir un cycle + son délai
+    const rows = await this._historyRows(c.entity_power, start, new Date());
+    const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const threshold = c.power_threshold ?? 8;
+
+    let running = false;
+    let runningSince = null;
+    let belowSince = null;
+
+    for (const row of rows) {
+      const val = parseFloat(row.state ?? row.s);
+      const ts = row.last_changed ?? row.lu;
+      if (isNaN(val) || !ts) continue;
+      if (val > threshold) {
+        belowSince = null;
+        if (!running) {
+          running = true;
+          runningSince = ts;
+        }
+      } else if (running) {
+        if (belowSince === null) belowSince = new Date(ts).getTime();
+        if (new Date(ts).getTime() - belowSince >= stopDelayMs) {
+          running = false;
+          runningSince = null;
+          belowSince = null;
+        }
+      }
+    }
+    // Vérifie si le délai s'est écoulé entre la dernière donnée et maintenant
+    if (running && belowSince !== null && Date.now() - belowSince >= stopDelayMs) {
+      running = false;
+      runningSince = null;
+      belowSince = null;
+    }
+
+    this._running = running;
+    this._runningSince = runningSince;
+    this._belowSince = belowSince;
+    this._bootstrapped = true;
+    this._update();
+    this._refreshPeriodStats();
+  }
+
+  // ------------------------------------------------------------------
+  // Machine à état "en direct" : à chaque mise à jour, on avance le
+  // même algorithme seuil + délai que le bootstrap, à partir de la
+  // dernière valeur connue de sensor.xxx_power.
+  // ------------------------------------------------------------------
+  _advanceRunningState() {
+    const c = this.config;
+    const threshold = c.power_threshold ?? 8;
+    const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const powerW = this._num(c.entity_power, 0);
+    const now = Date.now();
+
+    if (powerW > threshold) {
+      this._belowSince = null;
+      if (!this._running) {
+        this._running = true;
+        this._runningSince = new Date().toISOString();
+      }
+    } else if (this._running) {
+      if (this._belowSince === null) this._belowSince = now;
+      if (now - this._belowSince >= stopDelayMs) {
+        this._running = false;
+        this._runningSince = null;
+        this._belowSince = null;
+      }
+    }
+  }
+
   // ------------------------------------------------------------------
   // Valeur du capteur d'énergie au début d'une période (semaine/mois),
-  // lue dans les statistiques long terme de Home Assistant — celles-ci
-  // sont conservées indéfiniment, contrairement à l'historique brut.
+  // lue dans les statistiques long terme de Home Assistant (conservées
+  // indéfiniment par défaut, contrairement à l'historique brut). Ce
+  // sont les statistiques natives de votre capteur d'énergie — aucune
+  // entité supplémentaire n'est créée.
   // ------------------------------------------------------------------
   async _energyAtPeriodStart(startDate) {
     const energyId = this.config.entity_energy;
@@ -135,54 +242,54 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
-  // Historique brut de l'état "en fonctionnement" depuis une date donnée,
-  // utilisé pour compter les cycles terminés (transitions on -> off).
-  // Nécessite que le recorder conserve l'historique sur toute la période
-  // souhaitée (voir purge_keep_days dans configuration.yaml).
+  // Compte les cycles terminés en rejouant l'historique brut de la
+  // puissance avec le même algorithme seuil + délai + durée minimale.
   // ------------------------------------------------------------------
-  async _runningHistorySince(startDate) {
-    const runId = this.config.entity_running;
-    try {
-      const result = await this._hass.callWS({
-        type: "history/history_during_period",
-        start_time: startDate.toISOString(),
-        end_time: new Date().toISOString(),
-        entity_ids: [runId],
-        minimal_response: false,
-        no_attributes: true,
-      });
-      return (result && result[runId]) || [];
-    } catch (e) {
-      return [];
-    }
-  }
+  _countCyclesFromPowerHistory(rows, weekStart) {
+    const c = this.config;
+    const threshold = c.power_threshold ?? 8;
+    const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
 
-  _countCompletedCycles(rows, weekStart, monthStartUnusedYet) {
-    const MIN_MS = 5 * 60 * 1000; // ignore les faux départs < 5 min
+    let running = false;
+    let onSince = null;
+    let belowSince = null;
     let weekCount = 0;
     let monthCount = 0;
-    let onSince = null;
+
     for (const row of rows) {
-      const state = row.state ?? row.s;
+      const val = parseFloat(row.state ?? row.s);
       const ts = row.last_changed ?? row.lu;
-      if (!ts) continue;
-      if (state === "on" && onSince === null) {
-        onSince = new Date(ts).getTime();
-      } else if (state === "off" && onSince !== null) {
-        const offTs = new Date(ts).getTime();
-        if (offTs - onSince >= MIN_MS) {
-          monthCount++;
-          if (offTs >= weekStart.getTime()) weekCount++;
+      if (isNaN(val) || !ts) continue;
+      const tsMs = new Date(ts).getTime();
+
+      if (val > threshold) {
+        belowSince = null;
+        if (!running) {
+          running = true;
+          onSince = tsMs;
         }
-        onSince = null;
+      } else if (running) {
+        if (belowSince === null) belowSince = tsMs;
+        if (tsMs - belowSince >= stopDelayMs) {
+          const cycleEnd = belowSince; // la conso a vraiment cessé à cet instant
+          if (cycleEnd - onSince >= minCycleMs) {
+            monthCount++;
+            if (cycleEnd >= weekStart.getTime()) weekCount++;
+          }
+          running = false;
+          onSince = null;
+          belowSince = null;
+        }
       }
     }
     return { weekCount, monthCount };
   }
 
   // ------------------------------------------------------------------
-  // Recalcule les stats semaine/mois depuis l'historique et les
-  // statistiques — appelé périodiquement, jamais via des capteurs dédiés.
+  // Recalcule les stats semaine/mois depuis l'historique natif de la
+  // puissance et les statistiques natives de l'énergie — rien n'est
+  // stocké côté Home Assistant, tout est reconstruit à chaque appel.
   // ------------------------------------------------------------------
   async _refreshPeriodStats() {
     if (this._statsLoading) return;
@@ -193,14 +300,14 @@ class CarteLaundry extends HTMLElement {
       const weekStart = this._startOfWeek(now);
       const monthStart = this._startOfMonth(now);
 
-      const [weekBase, monthBase, runningRows] = await Promise.all([
+      const [weekBase, monthBase, powerRows] = await Promise.all([
         this._energyAtPeriodStart(weekStart),
         this._energyAtPeriodStart(monthStart),
-        this._runningHistorySince(monthStart),
+        this._historyRows(c.entity_power, monthStart, now),
       ]);
 
       const currentEnergy = c.entity_energy ? this._num(c.entity_energy, null) : null;
-      const price = c.entity_price ? this._num(c.entity_price, 0) : 0;
+      const price = c.price_kwh ?? 0;
 
       this._weekCost = weekBase !== null && currentEnergy !== null
         ? Math.max(0, currentEnergy - weekBase) * price
@@ -209,7 +316,7 @@ class CarteLaundry extends HTMLElement {
         ? Math.max(0, currentEnergy - monthBase) * price
         : null;
 
-      const { weekCount, monthCount } = this._countCompletedCycles(runningRows, weekStart, monthStart);
+      const { weekCount, monthCount } = this._countCyclesFromPowerHistory(powerRows, weekStart);
       this._weekCount = weekCount;
       this._monthCount = monthCount;
 
@@ -222,32 +329,19 @@ class CarteLaundry extends HTMLElement {
 
   // ------------------------------------------------------------------
   // Énergie au tout début du cycle en cours, pour afficher son coût en
-  // direct — récupérée depuis l'historique récent (toujours disponible,
-  // même avec une rétention recorder courte).
+  // direct — récupérée depuis l'historique récent de sensor.xxx_energy.
   // ------------------------------------------------------------------
   async _ensureCycleBaseline() {
     const energyId = this.config.entity_energy;
     if (!energyId || !this._runningSince) return;
     if (this._cycleBaselineFor === this._runningSince) return;
-    try {
-      const result = await this._hass.callWS({
-        type: "history/history_during_period",
-        start_time: this._runningSince,
-        end_time: new Date().toISOString(),
-        entity_ids: [energyId],
-        minimal_response: false,
-        no_attributes: true,
-      });
-      const rows = (result && result[energyId]) || [];
-      const first = rows.find((r) => {
-        const s = r.state ?? r.s;
-        return s !== undefined && s !== "unknown" && s !== "unavailable";
-      });
-      const state = first ? (first.state ?? first.s) : null;
-      this._cycleBaselineEnergy = state !== null ? parseFloat(state) : this._num(energyId, null);
-    } catch (e) {
-      this._cycleBaselineEnergy = this._num(energyId, null);
-    }
+    const rows = await this._historyRows(energyId, new Date(this._runningSince), new Date());
+    const first = rows.find((r) => {
+      const s = r.state ?? r.s;
+      return s !== undefined && s !== "unknown" && s !== "unavailable";
+    });
+    const state = first ? (first.state ?? first.s) : null;
+    this._cycleBaselineEnergy = state !== null ? parseFloat(state) : this._num(energyId, null);
     this._cycleBaselineFor = this._runningSince;
   }
 
@@ -383,6 +477,7 @@ class CarteLaundry extends HTMLElement {
   }
 
   _update() {
+    if (!this._bootstrapped) return; // attend la reconstruction initiale de l'état
     const sr = this.shadowRoot;
     const c = this.config;
     const type = this._type;
@@ -393,16 +488,13 @@ class CarteLaundry extends HTMLElement {
     sr.getElementById("cll-weeklabel").textContent = type.cycleWord;
     sr.getElementById("cll-monthlabel").textContent = type.cycleWord;
 
-    // Applique la palette et l'effet visuel propres au type d'appareil
     const card = sr.querySelector("ha-card.cll");
     card.style.setProperty("--run", type.accent);
     card.style.setProperty("--run-dim", type.accentDim);
 
-    const runningState = this._entity(c.entity_running);
-    const running = runningState && runningState.state === "on";
     const wasRunning = this._running;
-    this._running = running;
-    this._runningSince = runningState ? runningState.last_changed : null;
+    this._advanceRunningState();
+    const running = this._running;
 
     const pill = sr.getElementById("cll-pill");
     const led = sr.getElementById("cll-led");
@@ -419,8 +511,6 @@ class CarteLaundry extends HTMLElement {
     led.classList.toggle("on", running);
     status.textContent = running ? "En fonctionnement" : "À l'arrêt";
 
-    // Anime le hublot avec l'effet propre au type d'appareil
-    // (remous d'eau pour un lave-linge, pulsation de chaleur pour un sèche-linge)
     liquid.classList.remove("spin", "glow");
     liquid2.classList.remove("spin", "glow");
     if (running) {
@@ -428,8 +518,6 @@ class CarteLaundry extends HTMLElement {
       liquid2.classList.add(type.motion);
     }
 
-    // La conso en direct (hublot + courant/durée/coût) n'est affichée
-    // que lorsque la machine tourne réellement.
     porthole.style.display = running ? "flex" : "none";
     liverow.style.display = running ? "flex" : "none";
     idlenote.style.display = running ? "none" : "block";
@@ -448,15 +536,12 @@ class CarteLaundry extends HTMLElement {
       }
       this._updateDuration();
 
-      // Un nouveau cycle vient de démarrer : on va chercher l'énergie de
-      // référence dans l'historique récent (pas de capteur dédié).
       if (!wasRunning) this._ensureCycleBaseline();
 
-      if (c.entity_energy && c.entity_price) {
+      if (c.entity_energy) {
         if (this._cycleBaselineEnergy != null) {
           const currentEnergy = this._num(c.entity_energy, 0);
-          const price = this._num(c.entity_price, 0);
-          const cost = Math.max(0, currentEnergy - this._cycleBaselineEnergy) * price;
+          const cost = Math.max(0, currentEnergy - this._cycleBaselineEnergy) * (c.price_kwh ?? 0);
           sr.getElementById("cll-cyclecost").textContent = this._fmtEuro(cost);
         } else {
           sr.getElementById("cll-cyclecost").textContent = "…";
@@ -464,15 +549,9 @@ class CarteLaundry extends HTMLElement {
       }
     }
 
-    // Un cycle vient de se terminer : les stats semaine/mois seront
-    // légèrement obsolètes le temps que le recorder écrive l'historique,
-    // on les rafraîchit peu après.
     if (wasRunning && !running) {
       setTimeout(() => this._refreshPeriodStats(), 15000);
     }
-
-    // Rafraîchissement périodique des stats semaine/mois (calculées à la
-    // volée depuis l'historique — aucun capteur dédié à créer).
     if (!this._lastStatsFetch || Date.now() - this._lastStatsFetch > 5 * 60 * 1000) {
       this._lastStatsFetch = Date.now();
       this._refreshPeriodStats();
@@ -489,12 +568,10 @@ class CarteLaundry extends HTMLElement {
       appliance_type: "washer",
       name: "Lave-linge",
       subtitle: "Buanderie",
-      power_scale_max: 2200,
+      ...CLL_DEFAULTS,
       entity_power: "sensor.lave_linge_power",
       entity_current: "sensor.lave_linge_current",
       entity_energy: "sensor.lave_linge_energy",
-      entity_running: "binary_sensor.lave_linge_cycle_en_cours",
-      entity_price: "input_number.prix_kwh",
     };
   }
 
@@ -506,25 +583,28 @@ class CarteLaundry extends HTMLElement {
 customElements.define("carte-laundry", CarteLaundry);
 
 // ==========================================================================
-// Éditeur graphique — permet de configurer la carte depuis l'interface
-// Home Assistant (Modifier le tableau de bord > Modifier la carte),
-// sans écrire de YAML. Inclut le choix du type d'appareil.
+// Éditeur graphique — configuration entièrement via l'interface Home
+// Assistant (Modifier le tableau de bord > Modifier la carte). Aucun YAML
+// à écrire, aucune entité à créer : seuil, délai et prix du kWh sont de
+// simples valeurs saisies ici.
 // ==========================================================================
 const CLL_LABELS = {
   appliance_type: "Type d'appareil",
   name: "Nom de l'appareil",
   subtitle: "Sous-titre",
-  power_scale_max: "Échelle du hublot (W)",
   entity_power: "Capteur de puissance (W)",
   entity_current: "Capteur de courant (A)",
   entity_energy: "Capteur d'énergie cumulée (kWh)",
-  entity_running: "Capteur « cycle en cours »",
-  entity_price: "Prix du kWh (calcul uniquement, non affiché)",
+  power_scale_max: "Échelle du hublot (W)",
+  power_threshold: "Seuil de démarrage (W)",
+  stop_delay_minutes: "Délai avant arrêt détecté (min)",
+  min_cycle_minutes: "Durée minimale d'un cycle (min)",
+  price_kwh: "Prix du kWh (€)",
 };
 
 class CarteLaundryEditor extends HTMLElement {
   setConfig(config) {
-    this._config = { appliance_type: "washer", ...config };
+    this._config = { appliance_type: "washer", ...CLL_DEFAULTS, ...config };
     this._render();
   }
 
@@ -565,8 +645,22 @@ class CarteLaundryEditor extends HTMLElement {
       { name: "entity_power", selector: { entity: { domain: "sensor" } } },
       { name: "entity_current", selector: { entity: { domain: "sensor" } } },
       { name: "entity_energy", selector: { entity: { domain: "sensor" } } },
-      { name: "entity_running", selector: { entity: { domain: "binary_sensor" } } },
-      { name: "entity_price", selector: { entity: { domain: "input_number" } } },
+      {
+        name: "",
+        type: "grid",
+        schema: [
+          { name: "power_threshold", selector: { number: { mode: "box", min: 1, max: 200, step: 1 } } },
+          { name: "stop_delay_minutes", selector: { number: { mode: "box", min: 0, max: 30, step: 1 } } },
+        ],
+      },
+      {
+        name: "",
+        type: "grid",
+        schema: [
+          { name: "min_cycle_minutes", selector: { number: { mode: "box", min: 0, max: 60, step: 1 } } },
+          { name: "price_kwh", selector: { number: { mode: "box", min: 0, max: 2, step: 0.0001 } } },
+        ],
+      },
     ];
   }
 
@@ -595,5 +689,5 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "carte-laundry",
   name: "Carte Laundry",
-  description: "Carte de suivi de consommation pour lave-linge ou sèche-linge connecté (design adapté au type d'appareil)",
+  description: "Carte de suivi de consommation pour lave-linge ou sèche-linge connecté — sans entité à créer, tout se configure via l'interface",
 });

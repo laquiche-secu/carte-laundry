@@ -95,6 +95,11 @@ class CarteLaundry extends HTMLElement {
   _fmtDuration(sinceIso) {
     if (!sinceIso) return "00:00";
     const diffSec = Math.max(0, Math.floor((Date.now() - new Date(sinceIso).getTime()) / 1000));
+    return this._fmtDurationMs(diffSec * 1000);
+  }
+
+  _fmtDurationMs(ms) {
+    const diffSec = Math.max(0, Math.floor(ms / 1000));
     const h = Math.floor(diffSec / 3600);
     const m = Math.floor((diffSec % 3600) / 60).toString().padStart(2, "0");
     const s = (diffSec % 60).toString().padStart(2, "0");
@@ -120,16 +125,11 @@ class CarteLaundry extends HTMLElement {
 
   async _historyRows(entityId, startDate, endDate) {
     try {
-      const result = await this._hass.callWS({
-        type: "history/history_during_period",
-        start_time: startDate.toISOString(),
-        end_time: endDate.toISOString(),
-        entity_ids: [entityId],
-        minimal_response: false,
-        no_attributes: true,
-      });
-      return (result && result[entityId]) || [];
+      const url = `history/period/${startDate.toISOString()}?filter_entity_id=${entityId}&end_time=${endDate.toISOString()}&minimal_response=false&no_attributes=true`;
+      const data = await this._hass.callApi("GET", url);
+      return (data && data[0]) || [];
     } catch (e) {
+      console.warn("carte-laundry: échec de récupération de l'historique pour", entityId, e);
       return [];
     }
   }
@@ -144,11 +144,13 @@ class CarteLaundry extends HTMLElement {
     const start = new Date(Date.now() - 6 * 3600 * 1000); // 6h suffisent pour couvrir un cycle + son délai
     const rows = await this._historyRows(c.entity_power, start, new Date());
     const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
     const threshold = c.power_threshold ?? 8;
 
     let running = false;
     let runningSince = null;
     let belowSince = null;
+    let lastCompleted = null; // {start, end}
 
     for (const row of rows) {
       const val = parseFloat(row.state ?? row.s);
@@ -163,6 +165,11 @@ class CarteLaundry extends HTMLElement {
       } else if (running) {
         if (belowSince === null) belowSince = new Date(ts).getTime();
         if (new Date(ts).getTime() - belowSince >= stopDelayMs) {
+          const cycleEnd = belowSince;
+          const cycleStart = new Date(runningSince).getTime();
+          if (cycleEnd - cycleStart >= minCycleMs) {
+            lastCompleted = { start: cycleStart, end: cycleEnd };
+          }
           running = false;
           runningSince = null;
           belowSince = null;
@@ -171,6 +178,11 @@ class CarteLaundry extends HTMLElement {
     }
     // Vérifie si le délai s'est écoulé entre la dernière donnée et maintenant
     if (running && belowSince !== null && Date.now() - belowSince >= stopDelayMs) {
+      const cycleEnd = belowSince;
+      const cycleStart = new Date(runningSince).getTime();
+      if (cycleEnd - cycleStart >= minCycleMs) {
+        lastCompleted = { start: cycleStart, end: cycleEnd };
+      }
       running = false;
       runningSince = null;
       belowSince = null;
@@ -180,6 +192,12 @@ class CarteLaundry extends HTMLElement {
     this._runningSince = runningSince;
     this._belowSince = belowSince;
     this._bootstrapped = true;
+
+    if (lastCompleted) {
+      this._lastCycle = { ...lastCompleted, cost: null };
+      this._computeCycleCost(lastCompleted.start, lastCompleted.end);
+    }
+
     this._update();
     this._refreshPeriodStats();
   }
@@ -193,6 +211,7 @@ class CarteLaundry extends HTMLElement {
     const c = this.config;
     const threshold = c.power_threshold ?? 8;
     const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
+    const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
     const powerW = this._num(c.entity_power, 0);
     const now = Date.now();
 
@@ -205,10 +224,35 @@ class CarteLaundry extends HTMLElement {
     } else if (this._running) {
       if (this._belowSince === null) this._belowSince = now;
       if (now - this._belowSince >= stopDelayMs) {
+        const cycleEnd = this._belowSince;
+        const cycleStart = new Date(this._runningSince).getTime();
+        if (cycleEnd - cycleStart >= minCycleMs) {
+          this._lastCycle = { start: cycleStart, end: cycleEnd, cost: null };
+          this._computeCycleCost(cycleStart, cycleEnd);
+        }
         this._running = false;
         this._runningSince = null;
         this._belowSince = null;
       }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Coût d'un cycle défini par [startMs, endMs], à partir de
+  // l'historique brut du capteur d'énergie sur cette fenêtre précise.
+  // ------------------------------------------------------------------
+  async _computeCycleCost(startMs, endMs) {
+    const energyId = this.config.entity_energy;
+    if (!energyId) return;
+    const rows = await this._historyRows(energyId, new Date(startMs), new Date(endMs));
+    const numeric = rows
+      .map((r) => ({ v: parseFloat(r.state ?? r.s), ts: r.last_changed ?? r.lu }))
+      .filter((r) => !isNaN(r.v));
+    if (numeric.length < 2) return;
+    const cost = Math.max(0, numeric[numeric.length - 1].v - numeric[0].v) * (this.config.price_kwh ?? 0);
+    if (this._lastCycle && this._lastCycle.start === startMs && this._lastCycle.end === endMs) {
+      this._lastCycle.cost = cost;
+      this._update();
     }
   }
 
@@ -237,6 +281,37 @@ class CarteLaundry extends HTMLElement {
       const first = rows.find((r) => typeof r.sum === "number");
       return first ? first.sum : null;
     } catch (e) {
+      console.warn("carte-laundry: échec de lecture des statistiques (début de période)", e);
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Valeur la plus récente du capteur d'énergie, lue via les mêmes
+  // statistiques long terme (et non l'état brut de l'entité). Important :
+  // les statistiques d'un capteur "energy" sont normalisées en kWh par
+  // Home Assistant, alors que l'état brut peut être dans une autre unité
+  // (Wh par ex.). Comparer les deux directement provoquait un coût
+  // totalement faussé — on compare donc toujours statistique à statistique.
+  // ------------------------------------------------------------------
+  async _latestEnergyStat() {
+    const energyId = this.config.entity_energy;
+    if (!energyId) return null;
+    try {
+      const end = new Date();
+      const start = new Date(end.getTime() - 6 * 3600 * 1000);
+      const stats = await this._hass.callWS({
+        type: "recorder/statistics_during_period",
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        statistic_ids: [energyId],
+        period: "hour",
+        types: ["sum"],
+      });
+      const rows = ((stats && stats[energyId]) || []).filter((r) => typeof r.sum === "number");
+      return rows.length ? rows[rows.length - 1].sum : null;
+    } catch (e) {
+      console.warn("carte-laundry: échec de lecture des statistiques (valeur actuelle)", e);
       return null;
     }
   }
@@ -300,20 +375,20 @@ class CarteLaundry extends HTMLElement {
       const weekStart = this._startOfWeek(now);
       const monthStart = this._startOfMonth(now);
 
-      const [weekBase, monthBase, powerRows] = await Promise.all([
+      const [weekBase, monthBase, nowSum, powerRows] = await Promise.all([
         this._energyAtPeriodStart(weekStart),
         this._energyAtPeriodStart(monthStart),
+        this._latestEnergyStat(),
         this._historyRows(c.entity_power, monthStart, now),
       ]);
 
-      const currentEnergy = c.entity_energy ? this._num(c.entity_energy, null) : null;
       const price = c.price_kwh ?? 0;
 
-      this._weekCost = weekBase !== null && currentEnergy !== null
-        ? Math.max(0, currentEnergy - weekBase) * price
+      this._weekCost = weekBase !== null && nowSum !== null
+        ? Math.max(0, nowSum - weekBase) * price
         : null;
-      this._monthCost = monthBase !== null && currentEnergy !== null
-        ? Math.max(0, currentEnergy - monthBase) * price
+      this._monthCost = monthBase !== null && nowSum !== null
+        ? Math.max(0, nowSum - monthBase) * price
         : null;
 
       const { weekCount, monthCount } = this._countCyclesFromPowerHistory(powerRows, weekStart);
@@ -406,6 +481,8 @@ class CarteLaundry extends HTMLElement {
         .cll-liveitem .val.accent{ color: var(--run); }
         .cll-liveitem .val.cost{ color: var(--cost); }
         .cll-idlenote{ text-align:center; color: var(--secondary-text-color); font-size:12.5px; margin-top:8px; }
+        .cll-lastcycle{ text-align:center; }
+        .cll-lastcycle-label{ font-size:10.5px; color: var(--secondary-text-color); text-transform:uppercase; letter-spacing:.06em; margin-bottom:10px; }
 
         .cll-divider{ height:1px; background: var(--divider-color,#2c3947); margin:16px 0 14px; }
         .cll-stats{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
@@ -446,6 +523,14 @@ class CarteLaundry extends HTMLElement {
             <div class="cll-liveitem"><div class="lv">Courant</div><div class="val accent" id="cll-amp">0.0 A</div></div>
             <div class="cll-liveitem"><div class="lv">Durée</div><div class="val" id="cll-dur">00:00</div></div>
             <div class="cll-liveitem"><div class="lv">Coût cycle</div><div class="val cost" id="cll-cyclecost">0,00 €</div></div>
+          </div>
+          <div class="cll-lastcycle" id="cll-lastcycle" style="display:none;">
+            <div class="cll-lastcycle-label">Dernier cycle</div>
+            <div class="cll-liverow">
+              <div class="cll-liveitem"><div class="lv">Date</div><div class="val" id="cll-lastdate">—</div></div>
+              <div class="cll-liveitem"><div class="lv">Durée</div><div class="val" id="cll-lastdur">—</div></div>
+              <div class="cll-liveitem"><div class="lv">Coût</div><div class="val cost" id="cll-lastcost">—</div></div>
+            </div>
           </div>
           <div class="cll-idlenote" id="cll-idlenote">Aucune consommation détectée</div>
         </div>
@@ -505,6 +590,7 @@ class CarteLaundry extends HTMLElement {
     const watt = sr.getElementById("cll-watt");
     const liverow = sr.getElementById("cll-liverow");
     const idlenote = sr.getElementById("cll-idlenote");
+    const lastcycle = sr.getElementById("cll-lastcycle");
     const gaugeWrap = sr.getElementById("cll-gaugewrap");
 
     pill.classList.toggle("on", running);
@@ -520,8 +606,21 @@ class CarteLaundry extends HTMLElement {
 
     porthole.style.display = running ? "flex" : "none";
     liverow.style.display = running ? "flex" : "none";
-    idlenote.style.display = running ? "none" : "block";
     gaugeWrap.classList.toggle("cll-idle-only", !running);
+
+    if (!running && this._lastCycle) {
+      lastcycle.style.display = "block";
+      idlenote.style.display = "none";
+      const lc = this._lastCycle;
+      sr.getElementById("cll-lastdate").textContent = new Date(lc.start).toLocaleString("fr-FR", {
+        day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+      });
+      sr.getElementById("cll-lastdur").textContent = this._fmtDurationMs(lc.end - lc.start);
+      sr.getElementById("cll-lastcost").textContent = lc.cost != null ? this._fmtEuro(lc.cost) : "…";
+    } else {
+      lastcycle.style.display = "none";
+      idlenote.style.display = running ? "none" : "block";
+    }
 
     if (running) {
       const powerW = this._num(c.entity_power, 0);

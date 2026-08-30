@@ -348,55 +348,12 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
-  // Énergie consommée sur une période, en sommant les variations
-  // horaires ("change") des statistiques long terme de Home Assistant.
-  // Beaucoup plus robuste qu'une différence entre deux points ponctuels :
-  // ça gère nativement les resets de compteur et les données éparses
-  // (par ex. si l'entité n'existait pas depuis le début du mois).
-  // ------------------------------------------------------------------
-  async _energyConsumedInPeriod(startDate, endDate) {
-    const energyId = this.config.entity_energy;
-    if (!energyId) return null;
-    try {
-      const stats = await this._hass.callWS({
-        type: "recorder/statistics_during_period",
-        start_time: startDate.toISOString(),
-        end_time: endDate.toISOString(),
-        statistic_ids: [energyId],
-        period: "hour",
-        types: ["change"],
-      });
-      const rows = (stats && stats[energyId]) || [];
-      if (!rows.length) return null;
-      // On ignore les variations négatives (reset de compteur mal détecté
-      // par Home Assistant) : une conso ne peut pas "reculer", sinon un
-      // seul reset dans le mois annule presque tout le total calculé.
-      return rows.reduce((sum, r) => sum + Math.max(0, typeof r.change === "number" ? r.change : 0), 0);
-    } catch (e) {
-      console.warn("carte-laundry: échec de lecture des statistiques (consommation période)", e);
-      return null;
-    }
-  }
-
-  // ------------------------------------------------------------------
-  // Compte les cycles terminés en rejouant l'historique brut de la
-  // puissance avec le même algorithme seuil + délai + durée minimale.
-  // ------------------------------------------------------------------
-  _countCyclesFromPowerHistory(rows, weekStart) {
-    const cycles = this._extractCyclesFromPowerRows(rows);
-    let weekCount = 0;
-    let monthCount = 0;
-    for (const cy of cycles) {
-      monthCount++;
-      if (cy.end >= weekStart.getTime()) weekCount++;
-    }
-    return { weekCount, monthCount };
-  }
-
-  // ------------------------------------------------------------------
-  // Recalcule les stats semaine/mois depuis l'historique natif de la
-  // puissance et les statistiques natives de l'énergie — rien n'est
-  // stocké côté Home Assistant, tout est reconstruit à chaque appel.
+  // Recalcule les stats semaine/mois — le coût n'est PAS déduit des
+  // statistiques long terme de Home Assistant (peu fiables selon la
+  // façon dont votre capteur gère les resets/unités), mais recalculé
+  // comme la somme du coût réel de chaque cycle détecté sur la période,
+  // exactement de la même manière que la popup d'historique et le
+  // "dernier cycle". Tout est donc cohérent entre les trois affichages.
   // ------------------------------------------------------------------
   async _refreshPeriodStats() {
     if (this._statsLoading) return;
@@ -406,21 +363,45 @@ class CarteLaundry extends HTMLElement {
       const now = new Date();
       const weekStart = this._startOfWeek(now);
       const monthStart = this._startOfMonth(now);
-
-      const [weekEnergy, monthEnergy, powerRows] = await Promise.all([
-        this._energyConsumedInPeriod(weekStart, now),
-        this._energyConsumedInPeriod(monthStart, now),
-        this._historyRows(c.entity_power, monthStart, now),
-      ]);
-
       const price = c.price_kwh ?? 0;
 
-      this._weekCost = weekEnergy !== null ? Math.max(0, weekEnergy) * price : null;
-      this._monthCost = monthEnergy !== null ? Math.max(0, monthEnergy) * price : null;
+      const [powerRows, energyRows] = await Promise.all([
+        this._historyRows(c.entity_power, monthStart, now),
+        c.entity_energy ? this._historyRows(c.entity_energy, monthStart, now) : Promise.resolve([]),
+      ]);
 
-      const { weekCount, monthCount } = this._countCyclesFromPowerHistory(powerRows, weekStart);
+      const cycles = this._extractCyclesFromPowerRows(powerRows);
+
+      let weekCount = 0;
+      let monthCount = 0;
+      let weekCost = 0;
+      let monthCost = 0;
+      let weekHasCost = false;
+      let monthHasCost = false;
+
+      for (const cy of cycles) {
+        monthCount++;
+        const inWeek = cy.end >= weekStart.getTime();
+        if (inWeek) weekCount++;
+
+        if (c.entity_energy) {
+          const kwh = this._energyDeltaFromRows(energyRows, cy.start, cy.end);
+          if (kwh != null) {
+            const cost = kwh * price;
+            monthCost += cost;
+            monthHasCost = true;
+            if (inWeek) {
+              weekCost += cost;
+              weekHasCost = true;
+            }
+          }
+        }
+      }
+
       this._weekCount = weekCount;
       this._monthCount = monthCount;
+      this._weekCost = weekHasCost ? weekCost : null;
+      this._monthCost = monthHasCost ? monthCost : null;
 
       this._renderStats();
     } finally {

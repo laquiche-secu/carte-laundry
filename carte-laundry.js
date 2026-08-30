@@ -41,6 +41,7 @@ const CLL_DEFAULTS = {
   stop_delay_minutes: 4,   // minutes sous le seuil avant de considérer que c'est arrêté (anti-pause)
   min_cycle_minutes: 5,    // durée minimale pour compter un vrai cycle (anti faux-départs)
   price_kwh: 0.2516,       // €/kWh
+  history_days: 60,        // profondeur de recherche pour la popup d'historique des cycles
 };
 
 class CarteLaundry extends HTMLElement {
@@ -236,6 +237,26 @@ class CarteLaundry extends HTMLElement {
     const c = this.config;
     const start = new Date(Date.now() - 7 * 24 * 3600 * 1000);
     const rows = await this._historyRows(c.entity_power, start, new Date());
+    const cycles = this._extractCyclesFromPowerRows(rows);
+    if (!cycles.length) return;
+    const last = cycles[cycles.length - 1];
+
+    if (!this._lastCycle || last.end > this._lastCycle.end) {
+      this._lastCycle = { ...last, cost: null };
+      this._computeCycleCost(last.start, last.end);
+      this._update();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Rejoue un historique de puissance brut et retourne la liste des
+  // cycles terminés (du plus ancien au plus récent), en appliquant le
+  // seuil, le délai anti-pause et la durée minimale configurés. Utilisé
+  // par le comptage semaine/mois, la recherche du dernier cycle, et la
+  // popup d'historique détaillé.
+  // ------------------------------------------------------------------
+  _extractCyclesFromPowerRows(rows) {
+    const c = this.config;
     const threshold = c.power_threshold ?? 8;
     const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
     const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
@@ -243,7 +264,7 @@ class CarteLaundry extends HTMLElement {
     let running = false;
     let onSince = null;
     let belowSince = null;
-    let last = null;
+    const cycles = [];
 
     for (const row of rows) {
       const val = this._rowPowerValue(row);
@@ -261,7 +282,7 @@ class CarteLaundry extends HTMLElement {
         if (tsMs - belowSince >= stopDelayMs) {
           const cycleEnd = belowSince;
           if (cycleEnd - onSince >= minCycleMs) {
-            last = { start: onSince, end: cycleEnd };
+            cycles.push({ start: onSince, end: cycleEnd });
           }
           running = false;
           onSince = null;
@@ -269,12 +290,7 @@ class CarteLaundry extends HTMLElement {
         }
       }
     }
-
-    if (last && (!this._lastCycle || last.end > this._lastCycle.end)) {
-      this._lastCycle = { ...last, cost: null };
-      this._computeCycleCost(last.start, last.end);
-      this._update();
-    }
+    return cycles;
   }
 
   // ------------------------------------------------------------------
@@ -367,42 +383,12 @@ class CarteLaundry extends HTMLElement {
   // puissance avec le même algorithme seuil + délai + durée minimale.
   // ------------------------------------------------------------------
   _countCyclesFromPowerHistory(rows, weekStart) {
-    const c = this.config;
-    const threshold = c.power_threshold ?? 8;
-    const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
-    const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
-
-    let running = false;
-    let onSince = null;
-    let belowSince = null;
+    const cycles = this._extractCyclesFromPowerRows(rows);
     let weekCount = 0;
     let monthCount = 0;
-
-    for (const row of rows) {
-      const val = this._rowPowerValue(row);
-      const ts = row.last_changed ?? row.lu;
-      if (val === null || !ts) continue;
-      const tsMs = new Date(ts).getTime();
-
-      if (val > threshold) {
-        belowSince = null;
-        if (!running) {
-          running = true;
-          onSince = tsMs;
-        }
-      } else if (running) {
-        if (belowSince === null) belowSince = tsMs;
-        if (tsMs - belowSince >= stopDelayMs) {
-          const cycleEnd = belowSince; // la conso a vraiment cessé à cet instant
-          if (cycleEnd - onSince >= minCycleMs) {
-            monthCount++;
-            if (cycleEnd >= weekStart.getTime()) weekCount++;
-          }
-          running = false;
-          onSince = null;
-          belowSince = null;
-        }
-      }
+    for (const cy of cycles) {
+      monthCount++;
+      if (cy.end >= weekStart.getTime()) weekCount++;
     }
     return { weekCount, monthCount };
   }
@@ -470,6 +456,97 @@ class CarteLaundry extends HTMLElement {
     sr.getElementById("cll-monthcost").textContent = this._monthCost != null ? this._fmtEuro(this._monthCost) : "—";
   }
 
+  // ------------------------------------------------------------------
+  // Énergie consommée entre deux instants, déduite d'un tableau
+  // d'historique déjà chargé (évite un appel réseau par cycle) : on
+  // garde la dernière valeur numérique connue avant/à chaque borne.
+  // ------------------------------------------------------------------
+  _energyDeltaFromRows(rows, startMs, endMs) {
+    let startVal = null;
+    let endVal = null;
+    for (const r of rows) {
+      const state = r.state ?? r.s;
+      if (state === "unavailable" || state === "unknown" || state === undefined) continue;
+      const v = parseFloat(state);
+      if (isNaN(v)) continue;
+      const ts = new Date(r.last_changed ?? r.lu).getTime();
+      if (ts <= startMs) startVal = v;
+      if (ts <= endMs) endVal = v;
+    }
+    if (startVal === null || endVal === null) return null;
+    return Math.max(0, endVal - startVal);
+  }
+
+  // ------------------------------------------------------------------
+  // Popup listant tous les cycles détectés sur les derniers jours
+  // (history_days, 60 par défaut), du plus récent au plus ancien, avec
+  // date, durée, énergie consommée et coût.
+  // ------------------------------------------------------------------
+  async _openHistoryDialog() {
+    const sr = this.shadowRoot;
+    const backdrop = sr.getElementById("cll-dialog-backdrop");
+    const body = sr.getElementById("cll-dialog-body");
+    backdrop.style.display = "flex";
+    body.innerHTML = `<div class="cll-dialog-loading">Chargement de l'historique…</div>`;
+
+    const c = this.config;
+    const days = c.history_days || 60;
+    const start = new Date(Date.now() - days * 24 * 3600 * 1000);
+    const now = new Date();
+
+    const [powerRows, energyRows] = await Promise.all([
+      this._historyRows(c.entity_power, start, now),
+      c.entity_energy ? this._historyRows(c.entity_energy, start, now) : Promise.resolve([]),
+    ]);
+
+    const cycles = this._extractCyclesFromPowerRows(powerRows);
+    const enriched = cycles
+      .map((cy) => {
+        const kwh = c.entity_energy ? this._energyDeltaFromRows(energyRows, cy.start, cy.end) : null;
+        const cost = kwh != null ? kwh * (c.price_kwh ?? 0) : null;
+        return { ...cy, kwh, cost };
+      })
+      .reverse(); // du plus récent au plus ancien
+
+    this._historyDialogCycles = enriched;
+    this._renderHistoryDialog();
+  }
+
+  _renderHistoryDialog() {
+    const body = this.shadowRoot.getElementById("cll-dialog-body");
+    const cycles = this._historyDialogCycles || [];
+    if (!cycles.length) {
+      body.innerHTML = `<div class="cll-dialog-empty">Aucun cycle détecté sur cette période.</div>`;
+      return;
+    }
+    body.innerHTML = cycles
+      .map((cy) => {
+        const dateStr = new Date(cy.start).toLocaleDateString("fr-FR", { day: "numeric", month: "short", year: "numeric" });
+        const timeStr = new Date(cy.start).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+        const durStr = this._fmtDurationMs(cy.end - cy.start);
+        const kwhStr = cy.kwh != null
+          ? cy.kwh.toLocaleString("fr-FR", { minimumFractionDigits: 3, maximumFractionDigits: 3 }) + " kWh"
+          : "—";
+        const costStr = cy.cost != null ? this._fmtEuro(cy.cost) : "—";
+        return `
+          <div class="cll-cycle-row">
+            <div>
+              <div class="cll-cycle-date">${dateStr}, ${timeStr}</div>
+              <div class="cll-cycle-sub">${durStr}</div>
+            </div>
+            <div class="cll-cycle-right">
+              <div class="cll-cycle-cost">${costStr}</div>
+              <div class="cll-cycle-kwh">${kwhStr}</div>
+            </div>
+          </div>`;
+      })
+      .join("");
+  }
+
+  _closeHistoryDialog() {
+    this.shadowRoot.getElementById("cll-dialog-backdrop").style.display = "none";
+  }
+
   _build() {
     const root = document.createElement("div");
     root.innerHTML = `
@@ -526,7 +603,23 @@ class CarteLaundry extends HTMLElement {
         .cll-lastcycle-label{ font-size:10.5px; color: var(--secondary-text-color); text-transform:uppercase; letter-spacing:.06em; margin-bottom:10px; }
 
         .cll-divider{ height:1px; background: var(--divider-color,#2c3947); margin:16px 0 14px; }
-        .cll-stats{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+        .cll-stats{ display:grid; grid-template-columns:1fr 1fr; gap:10px; cursor:pointer; }
+        .cll-stats:active .cll-stat{ opacity:.8; }
+
+        .cll-dialog-backdrop{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; align-items:center; justify-content:center; padding:20px; }
+        .cll-dialog{ background: var(--card-background-color,#1b242f); border:1px solid var(--divider-color,#2c3947); border-radius:16px; width:100%; max-width:420px; max-height:78vh; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.5); font-family: var(--paper-font-body1_-_font-family, sans-serif); }
+        .cll-dialog-header{ display:flex; align-items:center; justify-content:space-between; padding:16px 16px 14px 18px; border-bottom:1px solid var(--divider-color,#2c3947); flex-shrink:0; }
+        .cll-dialog-title{ font-weight:600; font-size:15px; color: var(--primary-text-color); }
+        .cll-dialog-close{ background:none; border:none; color: var(--secondary-text-color); font-size:15px; cursor:pointer; padding:6px 8px; line-height:1; }
+        .cll-dialog-body{ overflow-y:auto; padding:8px 10px 14px; }
+        .cll-dialog-loading, .cll-dialog-empty{ text-align:center; color: var(--secondary-text-color); padding:34px 10px; font-size:13px; }
+        .cll-cycle-row{ display:flex; align-items:center; justify-content:space-between; padding:11px 10px; border-radius:10px; }
+        .cll-cycle-row:nth-child(odd){ background: var(--secondary-background-color,#212c39); }
+        .cll-cycle-date{ font-size:12.5px; font-weight:600; color: var(--primary-text-color); }
+        .cll-cycle-sub{ font-size:10.5px; color: var(--secondary-text-color); margin-top:2px; }
+        .cll-cycle-right{ text-align:right; }
+        .cll-cycle-cost{ font-size:13px; font-weight:600; color: var(--cost); }
+        .cll-cycle-kwh{ font-size:10.5px; color: var(--secondary-text-color); margin-top:2px; }
         .cll-stat{ background: var(--secondary-background-color,#212c39); border-radius:12px; padding:12px 13px; }
         .cll-stat-label{ font-size:10px; color: var(--secondary-text-color); text-transform:uppercase; letter-spacing:.06em; margin-bottom:7px;}
         .cll-stat-main{ display:flex; align-items:baseline; gap:5px; margin-bottom:3px; }
@@ -578,7 +671,7 @@ class CarteLaundry extends HTMLElement {
 
         <div class="cll-divider"></div>
 
-        <div class="cll-stats">
+        <div class="cll-stats" id="cll-stats" title="Voir l'historique des cycles">
           <div class="cll-stat">
             <div class="cll-stat-label">Cette semaine</div>
             <div class="cll-stat-main"><span class="cll-stat-count" id="cll-weekcount">0</span><span class="cll-stat-countlabel" id="cll-weeklabel">lavages</span></div>
@@ -591,8 +684,27 @@ class CarteLaundry extends HTMLElement {
           </div>
         </div>
       </ha-card>
+
+      <div class="cll-dialog-backdrop" id="cll-dialog-backdrop">
+        <div class="cll-dialog" role="dialog" aria-label="Historique des cycles">
+          <div class="cll-dialog-header">
+            <div class="cll-dialog-title">Historique des cycles</div>
+            <button class="cll-dialog-close" id="cll-dialog-close" aria-label="Fermer">✕</button>
+          </div>
+          <div class="cll-dialog-body" id="cll-dialog-body">
+            <div class="cll-dialog-loading">Chargement…</div>
+          </div>
+        </div>
+      </div>
     `;
     this.attachShadow({ mode: "open" }).appendChild(root);
+
+    const sr = this.shadowRoot;
+    sr.getElementById("cll-stats").addEventListener("click", () => this._openHistoryDialog());
+    sr.getElementById("cll-dialog-close").addEventListener("click", () => this._closeHistoryDialog());
+    sr.getElementById("cll-dialog-backdrop").addEventListener("click", (ev) => {
+      if (ev.target.id === "cll-dialog-backdrop") this._closeHistoryDialog();
+    });
 
     this._durInterval = setInterval(() => this._updateDuration(), 1000);
   }
@@ -746,6 +858,7 @@ const CLL_LABELS = {
   stop_delay_minutes: "Délai avant arrêt détecté (min)",
   min_cycle_minutes: "Durée minimale d'un cycle (min)",
   price_kwh: "Prix du kWh (€)",
+  history_days: "Historique des cycles — profondeur (jours)",
 };
 
 class CarteLaundryEditor extends HTMLElement {
@@ -807,6 +920,7 @@ class CarteLaundryEditor extends HTMLElement {
           { name: "price_kwh", selector: { number: { mode: "box", min: 0, max: 2, step: 0.0001 } } },
         ],
       },
+      { name: "history_days", selector: { number: { mode: "box", min: 7, max: 365, step: 1 } } },
     ];
   }
 

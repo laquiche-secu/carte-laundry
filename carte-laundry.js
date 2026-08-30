@@ -136,6 +136,21 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
+  // Lit la valeur de puissance d'une ligne d'historique. Une coupure de
+  // communication (unavailable/unknown — Zigbee hors ligne, redémarrage
+  // HA...) est traitée comme une conso nulle plutôt qu'ignorée, sinon
+  // deux cycles séparés par une coupure se retrouvent fusionnés en un
+  // seul cycle géant et faux.
+  // ------------------------------------------------------------------
+  _rowPowerValue(row) {
+    const state = row.state ?? row.s;
+    if (state === undefined || state === null) return null;
+    if (state === "unavailable" || state === "unknown") return 0;
+    const v = parseFloat(state);
+    return isNaN(v) ? null : v;
+  }
+
+  // ------------------------------------------------------------------
   // Reconstruit l'état "en marche" au chargement de la carte, en
   // rejouant l'historique récent de la puissance (aucune entité dédiée
   // n'existe : tout est déduit de sensor.xxx_power + seuil/délai).
@@ -154,9 +169,9 @@ class CarteLaundry extends HTMLElement {
     let lastCompleted = null; // {start, end}
 
     for (const row of rows) {
-      const val = parseFloat(row.state ?? row.s);
+      const val = this._rowPowerValue(row);
       const ts = row.last_changed ?? row.lu;
-      if (isNaN(val) || !ts) continue;
+      if (val === null || !ts) continue;
       if (val > threshold) {
         belowSince = null;
         if (!running) {
@@ -199,6 +214,14 @@ class CarteLaundry extends HTMLElement {
       this._computeCycleCost(lastCompleted.start, lastCompleted.end);
     }
 
+    // Si la carte se charge alors qu'un cycle est déjà en cours, le
+    // "démarrage" n'est jamais observé par _update() (il n'y a pas de
+    // transition arrêt->marche à détecter) : on va donc chercher la
+    // référence de coût ici, explicitement.
+    if (running) {
+      this._ensureCycleBaseline();
+    }
+
     this._update();
     this._refreshPeriodStats();
   }
@@ -223,9 +246,9 @@ class CarteLaundry extends HTMLElement {
     let last = null;
 
     for (const row of rows) {
-      const val = parseFloat(row.state ?? row.s);
+      const val = this._rowPowerValue(row);
       const ts = row.last_changed ?? row.lu;
-      if (isNaN(val) || !ts) continue;
+      if (val === null || !ts) continue;
       const tsMs = new Date(ts).getTime();
       if (val > threshold) {
         belowSince = null;
@@ -329,7 +352,10 @@ class CarteLaundry extends HTMLElement {
       });
       const rows = (stats && stats[energyId]) || [];
       if (!rows.length) return null;
-      return rows.reduce((sum, r) => sum + (typeof r.change === "number" ? r.change : 0), 0);
+      // On ignore les variations négatives (reset de compteur mal détecté
+      // par Home Assistant) : une conso ne peut pas "reculer", sinon un
+      // seul reset dans le mois annule presque tout le total calculé.
+      return rows.reduce((sum, r) => sum + Math.max(0, typeof r.change === "number" ? r.change : 0), 0);
     } catch (e) {
       console.warn("carte-laundry: échec de lecture des statistiques (consommation période)", e);
       return null;
@@ -353,9 +379,9 @@ class CarteLaundry extends HTMLElement {
     let monthCount = 0;
 
     for (const row of rows) {
-      const val = parseFloat(row.state ?? row.s);
+      const val = this._rowPowerValue(row);
       const ts = row.last_changed ?? row.lu;
-      if (isNaN(val) || !ts) continue;
+      if (val === null || !ts) continue;
       const tsMs = new Date(ts).getTime();
 
       if (val > threshold) {
@@ -485,7 +511,7 @@ class CarteLaundry extends HTMLElement {
         .cll-liquid2.glow{ animation-delay:.4s; }
         @keyframes cllglow{ 0%,100%{ opacity:.45; transform:translate(-50%,0) scale(1);} 50%{ opacity:.8; transform:translate(-50%,0) scale(1.08);} }
         .cll-readout{ position:relative; z-index:2; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; }
-        .cll-watt{ font-size:26px; font-weight:600; letter-spacing:-.02em; font-variant-numeric: tabular-nums; }
+        .cll-watt{ font-size:22px; font-weight:600; letter-spacing:-.02em; font-variant-numeric: tabular-nums; }
         .cll-watt.idle{ color: var(--secondary-text-color); }
         .cll-wattunit{ font-size:10px; color: var(--secondary-text-color); margin-top:3px; letter-spacing:.06em; }
 
@@ -530,8 +556,8 @@ class CarteLaundry extends HTMLElement {
             <div class="cll-liquid" id="cll-liquid"></div>
             <div class="cll-liquid2" id="cll-liquid2"></div>
             <div class="cll-readout">
-              <div class="cll-watt idle" id="cll-watt">0</div>
-              <div class="cll-wattunit">WATTS</div>
+              <div class="cll-watt idle" id="cll-watt">0,000</div>
+              <div class="cll-wattunit">KWH DU CYCLE</div>
             </div>
           </div>
           <div class="cll-liverow" id="cll-liverow" style="display:none;">
@@ -639,7 +665,19 @@ class CarteLaundry extends HTMLElement {
 
     if (running) {
       const powerW = this._num(c.entity_power, 0);
-      watt.textContent = Math.round(powerW).toString();
+
+      // Le hublot affiche la conso cumulée du cycle en cours (kWh), pas
+      // la puissance instantanée — c'est ce qui permet de déduire le
+      // prix du cycle. Le remous visuel, lui, reste indexé sur la
+      // puissance instantanée (juste un indicateur d'intensité).
+      let cycleKwh = null;
+      if (c.entity_energy && this._cycleBaselineEnergy != null) {
+        const currentEnergy = this._num(c.entity_energy, 0);
+        cycleKwh = Math.max(0, currentEnergy - this._cycleBaselineEnergy);
+        watt.textContent = cycleKwh.toLocaleString("fr-FR", { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+      } else {
+        watt.textContent = "…";
+      }
 
       const pct = Math.max(0, Math.min(100, (powerW / (c.power_scale_max || 2200)) * 100));
       liquid.style.top = (100 - pct) + "%";
@@ -652,15 +690,9 @@ class CarteLaundry extends HTMLElement {
 
       if (!wasRunning) this._ensureCycleBaseline();
 
-      if (c.entity_energy) {
-        if (this._cycleBaselineEnergy != null) {
-          const currentEnergy = this._num(c.entity_energy, 0);
-          const cost = Math.max(0, currentEnergy - this._cycleBaselineEnergy) * (c.price_kwh ?? 0);
-          sr.getElementById("cll-cyclecost").textContent = this._fmtEuro(cost);
-        } else {
-          sr.getElementById("cll-cyclecost").textContent = "…";
-        }
-      }
+      sr.getElementById("cll-cyclecost").textContent = cycleKwh != null
+        ? this._fmtEuro(cycleKwh * (c.price_kwh ?? 0))
+        : "…";
     }
 
     if (wasRunning && !running) {

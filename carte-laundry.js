@@ -42,6 +42,7 @@ const CLL_DEFAULTS = {
   min_cycle_minutes: 5,    // durée minimale pour compter un vrai cycle (anti faux-départs)
   price_kwh: 0.2516,       // €/kWh
   history_days: 60,        // profondeur de recherche pour la popup d'historique des cycles
+  noise_ignore_seconds: 45, // pics de puissance isolés plus courts que ça = ignorés (bruit)
 };
 
 class CarteLaundry extends HTMLElement {
@@ -160,53 +161,29 @@ class CarteLaundry extends HTMLElement {
     const c = this.config;
     const start = new Date(Date.now() - 6 * 3600 * 1000); // 6h suffisent pour couvrir un cycle + son délai
     const rows = await this._historyRows(c.entity_power, start, new Date());
+    const points = this._powerPointsFromRows(rows);
+    const replay = this._replayPowerPoints(points);
     const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
     const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
-    const threshold = c.power_threshold ?? 8;
 
-    let running = false;
-    let runningSince = null;
-    let belowSince = null;
-    let lastCompleted = null; // {start, end}
+    let running = replay.running;
+    let onSinceMs = replay.onSince;
+    let belowSince = replay.belowSince;
+    let lastCompleted = replay.cycles.length ? replay.cycles[replay.cycles.length - 1] : null;
 
-    for (const row of rows) {
-      const val = this._rowPowerValue(row);
-      const ts = row.last_changed ?? row.lu;
-      if (val === null || !ts) continue;
-      if (val > threshold) {
-        belowSince = null;
-        if (!running) {
-          running = true;
-          runningSince = ts;
-        }
-      } else if (running) {
-        if (belowSince === null) belowSince = new Date(ts).getTime();
-        if (new Date(ts).getTime() - belowSince >= stopDelayMs) {
-          const cycleEnd = belowSince;
-          const cycleStart = new Date(runningSince).getTime();
-          if (cycleEnd - cycleStart >= minCycleMs) {
-            lastCompleted = { start: cycleStart, end: cycleEnd };
-          }
-          running = false;
-          runningSince = null;
-          belowSince = null;
-        }
-      }
-    }
-    // Vérifie si le délai s'est écoulé entre la dernière donnée et maintenant
+    // Vérifie si le délai d'arrêt s'est écoulé entre la dernière donnée et maintenant
     if (running && belowSince !== null && Date.now() - belowSince >= stopDelayMs) {
       const cycleEnd = belowSince;
-      const cycleStart = new Date(runningSince).getTime();
-      if (cycleEnd - cycleStart >= minCycleMs) {
-        lastCompleted = { start: cycleStart, end: cycleEnd };
+      if (cycleEnd - onSinceMs >= minCycleMs) {
+        lastCompleted = { start: onSinceMs, end: cycleEnd };
       }
       running = false;
-      runningSince = null;
+      onSinceMs = null;
       belowSince = null;
     }
 
     this._running = running;
-    this._runningSince = runningSince;
+    this._runningSince = onSinceMs !== null ? new Date(onSinceMs).toISOString() : null;
     this._belowSince = belowSince;
     this._bootstrapped = true;
 
@@ -249,37 +226,66 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
-  // Rejoue un historique de puissance brut et retourne la liste des
-  // cycles terminés (du plus ancien au plus récent), en appliquant le
-  // seuil, le délai anti-pause et la durée minimale configurés. Utilisé
-  // par le comptage semaine/mois, la recherche du dernier cycle, et la
-  // popup d'historique détaillé.
+  // Convertit un historique brut en liste triée de points {ts, val},
+  // en traitant les coupures (unavailable/unknown) comme une conso
+  // nulle plutôt que de les ignorer (sinon deux cycles séparés par une
+  // coupure réseau se retrouvent fusionnés en un seul cycle géant).
   // ------------------------------------------------------------------
-  _extractCyclesFromPowerRows(rows) {
+  _powerPointsFromRows(rows) {
+    const points = [];
+    for (const row of rows) {
+      const val = this._rowPowerValue(row);
+      const ts = row.last_changed ?? row.lu;
+      if (val === null || !ts) continue;
+      points.push({ ts: new Date(ts).getTime(), val });
+    }
+    return points;
+  }
+
+  // ------------------------------------------------------------------
+  // Rejoue une liste de points de puissance avec le seuil, le délai
+  // anti-pause et la durée minimale configurés, et retourne à la fois
+  // les cycles terminés ET l'état final (utile pour le bootstrap, qui a
+  // besoin de savoir si un cycle est encore en cours).
+  //
+  // Immunité au bruit : pendant le décompte d'arrêt (belowSince), une
+  // remontée au-dessus du seuil n'annule ce décompte QUE si elle n'est
+  // pas un pic isolé et bref — sinon un simple pic Wi-Fi ou électrique
+  // de quelques secondes empêchait indéfiniment la détection d'arrêt,
+  // fusionnant des cycles séparés de plusieurs heures en un seul.
+  // ------------------------------------------------------------------
+  _replayPowerPoints(points) {
     const c = this.config;
     const threshold = c.power_threshold ?? 8;
     const stopDelayMs = (c.stop_delay_minutes ?? 4) * 60000;
     const minCycleMs = (c.min_cycle_minutes ?? 5) * 60000;
+    const noiseIgnoreMs = (c.noise_ignore_seconds ?? 45) * 1000;
 
     let running = false;
     let onSince = null;
     let belowSince = null;
     const cycles = [];
 
-    for (const row of rows) {
-      const val = this._rowPowerValue(row);
-      const ts = row.last_changed ?? row.lu;
-      if (val === null || !ts) continue;
-      const tsMs = new Date(ts).getTime();
-      if (val > threshold) {
-        belowSince = null;
+    for (let i = 0; i < points.length; i++) {
+      const { ts, val } = points[i];
+      const above = val > threshold;
+
+      if (above) {
         if (!running) {
           running = true;
-          onSince = tsMs;
+          onSince = ts;
+          belowSince = null;
+        } else if (belowSince !== null) {
+          const next = points[i + 1];
+          const isolatedBlip = next && next.val <= threshold && (next.ts - ts) < noiseIgnoreMs;
+          if (!isolatedBlip) {
+            belowSince = null;
+          }
+          // sinon : pic isolé et bref -> on l'ignore, le décompte d'arrêt continue
         }
       } else if (running) {
-        if (belowSince === null) belowSince = tsMs;
-        if (tsMs - belowSince >= stopDelayMs) {
+        if (belowSince === null) belowSince = ts;
+        if (ts - belowSince >= stopDelayMs) {
           const cycleEnd = belowSince;
           if (cycleEnd - onSince >= minCycleMs) {
             cycles.push({ start: onSince, end: cycleEnd });
@@ -290,7 +296,17 @@ class CarteLaundry extends HTMLElement {
         }
       }
     }
-    return cycles;
+    return { cycles, running, onSince, belowSince };
+  }
+
+  // ------------------------------------------------------------------
+  // Rejoue un historique de puissance brut et retourne uniquement la
+  // liste des cycles terminés (du plus ancien au plus récent). Utilisé
+  // par le comptage semaine/mois (repli), la recherche du dernier
+  // cycle, et la popup d'historique détaillé.
+  // ------------------------------------------------------------------
+  _extractCyclesFromPowerRows(rows) {
+    return this._replayPowerPoints(this._powerPointsFromRows(rows)).cycles;
   }
 
   // ------------------------------------------------------------------
@@ -390,10 +406,12 @@ class CarteLaundry extends HTMLElement {
 
   // ------------------------------------------------------------------
   // Compte les cycles à partir des statistiques long terme de la
-  // puissance (max par heure, conservées indéfiniment), plutôt que de
-  // l'historique brut (limité par purge_keep_days). Granularité
-  // horaire : une heure est "active" si le max de puissance a dépassé
-  // le seuil au moins une fois pendant cette heure ; des heures actives
+  // puissance (moyenne par heure, conservées indéfiniment), plutôt que
+  // de l'historique brut (limité par purge_keep_days). On utilise la
+  // MOYENNE plutôt que le max : un pic de bruit isolé de quelques
+  // secondes ne déplace quasiment pas une moyenne horaire, alors qu'il
+  // suffisait à faire passer le max au-dessus du seuil et à compter une
+  // heure entière comme "active" à tort. Des heures actives
   // consécutives comptent comme un seul cycle. Retourne null si les
   // statistiques ne sont pas disponibles (fallback géré par l'appelant).
   // ------------------------------------------------------------------
@@ -407,9 +425,9 @@ class CarteLaundry extends HTMLElement {
         end_time: endDate.toISOString(),
         statistic_ids: [powerId],
         period: "hour",
-        types: ["max"],
+        types: ["mean"],
       });
-      const rows = ((stats && stats[powerId]) || []).filter((r) => typeof r.max === "number" && r.start !== undefined);
+      const rows = ((stats && stats[powerId]) || []).filter((r) => typeof r.mean === "number" && r.start !== undefined);
       if (!rows.length) return null;
 
       const toMs = (v) => (typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : new Date(v).getTime());
@@ -422,7 +440,7 @@ class CarteLaundry extends HTMLElement {
         const ts = toMs(r.start);
         const gap = prevTs !== null && ts - prevTs > 1.5 * 3600000;
         if (gap) wasActive = false; // trou de données -> on ne prolonge pas le cycle précédent
-        const active = r.max > threshold;
+        const active = r.mean > threshold;
         if (active && !wasActive) count++;
         wasActive = active;
         prevTs = ts;
@@ -916,6 +934,7 @@ const CLL_LABELS = {
   power_threshold: "Seuil de démarrage (W)",
   stop_delay_minutes: "Délai avant arrêt détecté (min)",
   min_cycle_minutes: "Durée minimale d'un cycle (min)",
+  noise_ignore_seconds: "Ignorer les pics isolés plus courts que (secondes)",
   price_kwh: "Prix du kWh (€)",
   history_days: "Historique des cycles — profondeur (jours)",
 };
@@ -976,10 +995,17 @@ class CarteLaundryEditor extends HTMLElement {
         type: "grid",
         schema: [
           { name: "min_cycle_minutes", selector: { number: { mode: "box", min: 0, max: 60, step: 1 } } },
-          { name: "price_kwh", selector: { number: { mode: "box", min: 0, max: 2, step: 0.0001 } } },
+          { name: "noise_ignore_seconds", selector: { number: { mode: "box", min: 0, max: 600, step: 5 } } },
         ],
       },
-      { name: "history_days", selector: { number: { mode: "box", min: 7, max: 365, step: 1 } } },
+      {
+        name: "",
+        type: "grid",
+        schema: [
+          { name: "price_kwh", selector: { number: { mode: "box", min: 0, max: 2, step: 0.0001 } } },
+          { name: "history_days", selector: { number: { mode: "box", min: 7, max: 365, step: 1 } } },
+        ],
+      },
     ];
   }
 

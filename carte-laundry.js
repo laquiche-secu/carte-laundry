@@ -248,11 +248,16 @@ class CarteLaundry extends HTMLElement {
   // les cycles terminés ET l'état final (utile pour le bootstrap, qui a
   // besoin de savoir si un cycle est encore en cours).
   //
-  // Immunité au bruit : pendant le décompte d'arrêt (belowSince), une
-  // remontée au-dessus du seuil n'annule ce décompte QUE si elle n'est
-  // pas un pic isolé et bref — sinon un simple pic Wi-Fi ou électrique
-  // de quelques secondes empêchait indéfiniment la détection d'arrêt,
-  // fusionnant des cycles séparés de plusieurs heures en un seul.
+  // Deux garde-fous :
+  // 1. Trous de rapport : un capteur qui ne remonte une valeur que sur
+  //    changement peut rester silencieux des heures une fois à 0. Si la
+  //    lecture suivante après une pause est haute (nouveau cycle), on
+  //    vérifie si le délai d'arrêt était déjà écoulé EN TEMPS RÉEL
+  //    (indépendamment de la présence d'une ligne d'historique basse
+  //    intermédiaire) : si oui, on clôt l'ancien cycle et on en démarre
+  //    un nouveau, au lieu de fusionner les deux à tort.
+  // 2. Pics isolés : pendant le décompte d'arrêt, une remontée brève et
+  //    isolée (bruit) n'annule pas le décompte.
   // ------------------------------------------------------------------
   _replayPowerPoints(points) {
     const c = this.config;
@@ -276,12 +281,24 @@ class CarteLaundry extends HTMLElement {
           onSince = ts;
           belowSince = null;
         } else if (belowSince !== null) {
-          const next = points[i + 1];
-          const isolatedBlip = next && next.val <= threshold && (next.ts - ts) < noiseIgnoreMs;
-          if (!isolatedBlip) {
+          if (ts - belowSince >= stopDelayMs) {
+            // Le délai d'arrêt était déjà écoulé avant cette remontée
+            // (trou de rapport) : ce n'est pas une reprise du cycle
+            // précédent, c'est un nouveau cycle qui démarre.
+            const cycleEnd = belowSince;
+            if (cycleEnd - onSince >= minCycleMs) {
+              cycles.push({ start: onSince, end: cycleEnd });
+            }
+            onSince = ts;
             belowSince = null;
+          } else {
+            const next = points[i + 1];
+            const isolatedBlip = next && next.val <= threshold && (next.ts - ts) < noiseIgnoreMs;
+            if (!isolatedBlip) {
+              belowSince = null; // reprise confirmée du même cycle
+            }
+            // sinon : pic isolé et bref -> on l'ignore, le décompte d'arrêt continue
           }
-          // sinon : pic isolé et bref -> on l'ignore, le décompte d'arrêt continue
         }
       } else if (running) {
         if (belowSince === null) belowSince = ts;

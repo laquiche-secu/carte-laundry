@@ -109,21 +109,8 @@ class CarteLaundry extends HTMLElement {
     return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
   }
 
-  _startOfWeek(d) {
-    // Semaine calée sur le lundi (convention française)
-    const date = new Date(d);
-    const day = date.getDay(); // 0 = dimanche
-    const diff = (day === 0 ? -6 : 1) - day;
-    date.setDate(date.getDate() + diff);
-    date.setHours(0, 0, 0, 0);
-    return date;
-  }
-
-  _startOfMonth(d) {
-    const date = new Date(d);
-    date.setDate(1);
-    date.setHours(0, 0, 0, 0);
-    return date;
+  _daysAgo(d, days) {
+    return new Date(d.getTime() - days * 24 * 3600 * 1000);
   }
 
   async _historyRows(entityId, startDate, endDate) {
@@ -381,19 +368,21 @@ class CarteLaundry extends HTMLElement {
   }
 
   // ------------------------------------------------------------------
-  // Recalcule les stats semaine/mois EXACTEMENT de la même manière que
-  // la popup d'historique : rejoue l'historique brut de la puissance
-  // pour détecter les cycles, puis calcule le coût de chaque cycle
-  // depuis l'historique brut du capteur d'énergie. Les statistiques
-  // long terme de Home Assistant se sont révélées trop peu fiables
-  // dans la pratique (calculs faux à répétition) pour être utilisées
-  // ici — cette méthode garantit que "cette semaine" / "ce mois-ci"
-  // correspondent toujours exactement à ce que montre la popup.
+  // Recalcule les stats des 7 et 30 derniers jours (fenêtres glissantes,
+  // pas calées sur le calendrier) EXACTEMENT de la même manière que la
+  // popup d'historique : rejoue l'historique brut de la puissance pour
+  // détecter les cycles, puis calcule le coût de chaque cycle depuis
+  // l'historique brut du capteur d'énergie. Les statistiques long terme
+  // de Home Assistant se sont révélées trop peu fiables dans la
+  // pratique (calculs faux à répétition) pour être utilisées ici —
+  // cette méthode garantit que les deux blocs correspondent toujours
+  // exactement à ce que montre la popup.
   //
   // Limite assumée : au-delà de la rétention du recorder
-  // (purge_keep_days, 10 jours par défaut), les vieux cycles du mois ne
-  // sont plus visibles. La semaine, elle, est toujours dans cette
-  // fenêtre par défaut et reste donc fiable dans tous les cas.
+  // (purge_keep_days, 10 jours par défaut), les cycles les plus anciens
+  // des 30 derniers jours ne sont plus visibles. Les 7 derniers jours,
+  // eux, sont toujours dans cette fenêtre par défaut et restent donc
+  // fiables dans tous les cas.
   // ------------------------------------------------------------------
   async _refreshPeriodStats() {
     if (this._statsLoading) return;
@@ -401,8 +390,8 @@ class CarteLaundry extends HTMLElement {
     try {
       const c = this.config;
       const now = new Date();
-      const weekStart = this._startOfWeek(now);
-      const monthStart = this._startOfMonth(now);
+      const weekStart = this._daysAgo(now, 7);
+      const monthStart = this._daysAgo(now, 30);
       const price = c.price_kwh ?? 0;
 
       const [powerRows, energyRows] = await Promise.all([
@@ -694,12 +683,12 @@ class CarteLaundry extends HTMLElement {
 
         <div class="cll-stats" id="cll-stats" title="Voir l'historique des cycles">
           <div class="cll-stat">
-            <div class="cll-stat-label">Cette semaine</div>
+            <div class="cll-stat-label">7 derniers jours</div>
             <div class="cll-stat-main"><span class="cll-stat-count" id="cll-weekcount">0</span><span class="cll-stat-countlabel" id="cll-weeklabel">lavages</span></div>
             <div class="cll-stat-cost" id="cll-weekcost">0,00 €</div>
           </div>
           <div class="cll-stat">
-            <div class="cll-stat-label">Ce mois-ci</div>
+            <div class="cll-stat-label">30 derniers jours</div>
             <div class="cll-stat-main"><span class="cll-stat-count" id="cll-monthcount">0</span><span class="cll-stat-countlabel" id="cll-monthlabel">lavages</span></div>
             <div class="cll-stat-cost" id="cll-monthcost">0,00 €</div>
           </div>
